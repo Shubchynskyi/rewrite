@@ -1,0 +1,170 @@
+name: Manual Maven module verification
+run-name: "Maven ${{ inputs.check }} / ${{ inputs.source_sha }}"
+
+'on':
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full commit SHA in this fork to verify
+        required: true
+        type: string
+      check:
+        description: Full Maven module build or only explicitly selected failed tests
+        required: true
+        type: choice
+        default: module-build
+        options:
+          - module-build
+          - selected-tests
+      test_filter:
+        description: Gradle --tests selectors, one per line; required for selected-tests
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "manual-maven-${{ inputs.source_sha }}-${{ inputs.check }}"
+  cancel-in-progress: false
+
+jobs:
+  maven:
+    name: rewrite-maven / Linux / Java 21
+    if: github.repository == 'Shubchynskyi/rewrite'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      CI_CHECK: ${{ inputs.check }}
+      TEST_FILTER: ${{ inputs.test_filter }}
+    steps:
+      - name: Check out the exact source commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify source and selection
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::A full commit SHA is required"; exit 1; }
+          actual_sha="$(git rev-parse HEAD)"
+          [[ "$actual_sha" == "$SOURCE_SHA" ]] || { echo "::error::Unexpected source commit"; exit 1; }
+          case "$CI_CHECK" in
+            module-build)
+              [[ -z "$TEST_FILTER" ]] || { echo "::error::test_filter is only valid for selected-tests"; exit 1; }
+              ;;
+            selected-tests)
+              [[ "$TEST_FILTER" =~ [^[:space:]] ]] || { echo "::error::Explicit test selectors are required"; exit 1; }
+              ;;
+            *) echo "::error::Unsupported check"; exit 1 ;;
+          esac
+          printf 'Verified source commit: %s\n' "$actual_sha"
+          git show --stat --oneline HEAD
+
+      - name: Install build toolchains and select Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: |
+            8
+            11
+            17
+            25
+            21
+
+      - name: Set up Gradle without a shared build cache
+        uses: gradle/actions/setup-gradle@v5
+        with:
+          cache-disabled: true
+
+      - name: Prepare the module build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+
+          settings = Path("settings.gradle.kts").read_text()
+          projects = settings.split("val allProjects = listOf(", 1)[1].split(")", 1)[0]
+          names = re.findall(r'"([^"]+)"', projects)
+          Path("IDE.properties").write_text("".join(name + "=\n" for name in names))
+          variables = ["JAVA_HOME", "JAVA_HOME_8_X64", "JAVA_HOME_11_X64",
+                       "JAVA_HOME_17_X64", "JAVA_HOME_21_X64", "JAVA_HOME_25_X64"]
+          paths = list(dict.fromkeys(os.environ[name] for name in variables if os.environ.get(name)))
+          with open(os.environ["GITHUB_ENV"], "a") as environment:
+              environment.write("CI_JDK_PATHS=" + ",".join(paths) + "\n")
+          PY
+          java -version
+
+      - name: Run the selected Maven check
+        id: build
+        shell: bash
+        env:
+          CODEGENOME_USERNAME: ${{ secrets.CODEGENOME_USERNAME }}
+          CODEGENOME_TOKEN: ${{ secrets.CODEGENOME_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$CODEGENOME_USERNAME" && -n "$CODEGENOME_TOKEN" ]] || { echo "::error::CodeGenome read credentials are required"; exit 1; }
+          args=(--no-daemon --no-scan --no-build-cache --console=plain --stacktrace
+                --warning-mode=none --max-workers=2 -Didea.active=true
+                "-Porg.gradle.java.installations.paths=$CI_JDK_PATHS")
+          if [[ "$CI_CHECK" == module-build ]]; then
+            args+=(:rewrite-maven:build)
+          else
+            args+=(:rewrite-maven:test)
+            while IFS= read -r selector; do
+              if [[ "$selector" =~ [^[:space:]] ]]; then
+                args+=(--tests "$selector")
+              fi
+            done <<< "$TEST_FILTER"
+          fi
+          ./gradlew "${args[@]}"
+
+      - name: Record the source and JUnit results
+        if: always()
+        shell: bash
+        env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          totals = dict(tests=0, failures=0, errors=0, skipped=0)
+          failures = []
+          for report in Path("rewrite-maven/build/test-results/test").glob("TEST-*.xml"):
+              suite = ET.parse(report).getroot()
+              for key in totals:
+                  totals[key] += int(suite.get(key, 0))
+              for test in suite.findall("testcase"):
+                  for failure in [*test.findall("failure"), *test.findall("error")]:
+                      failures.append((test.get("classname"), test.get("name"), failure.get("message", "")))
+          passed = totals["tests"] - totals["failures"] - totals["errors"] - totals["skipped"]
+          lines = [
+              "## Maven module verification",
+              "",
+              "Source: `" + os.environ["SOURCE_SHA"] + "`",
+              "Check: `" + os.environ["CI_CHECK"] + "`",
+              "Build step: `" + os.environ.get("BUILD_OUTCOME", "not run") + "`",
+              "",
+              f"JUnit: {passed} passed, {totals['skipped']} skipped, "
+              f"{totals['failures']} failed, {totals['errors']} errors.",
+          ]
+          if totals["tests"] == 0:
+              lines.append("No JUnit reports were produced; this does not confirm test execution.")
+          for classname, name, message in failures:
+              lines.extend(["", f"### {classname}.{name}", "", "~~~~", message[:4000], "~~~~"])
+          summary = "\n".join(lines) + "\n"
+          print(summary)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
+              output.write(summary)
+          PY
+
